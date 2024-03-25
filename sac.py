@@ -1,4 +1,4 @@
-import gym
+import gymnasium as gym
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,14 +7,16 @@ from torch.distributions import Normal
 import numpy as np
 import collections, random
 
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
 #Hyperparameters
-lr_pi           = 0.0005
-lr_q            = 0.001
+lr_pi           = 0.0003
+lr_q            = 0.0003
 init_alpha      = 0.01
-gamma           = 0.98
-batch_size      = 32
-buffer_limit    = 50000
-tau             = 0.01 # for target network soft update
+gamma           = 0.99
+batch_size      = 256
+buffer_limit    = 1000000
+tau             = 0.005 # for target network soft update
 target_entropy  = -1.0 # for automated alpha update
 lr_alpha        = 0.001  # for automated alpha update
 
@@ -32,25 +34,28 @@ class ReplayBuffer():
         for transition in mini_batch:
             s, a, r, s_prime, done = transition
             s_lst.append(s)
-            a_lst.append([a])
+            a_lst.append(a)
             r_lst.append([r])
             s_prime_lst.append(s_prime)
             done_mask = 0.0 if done else 1.0 
             done_mask_lst.append([done_mask])
         
-        return torch.tensor(s_lst, dtype=torch.float), torch.tensor(a_lst, dtype=torch.float), \
-                torch.tensor(r_lst, dtype=torch.float), torch.tensor(s_prime_lst, dtype=torch.float), \
-                torch.tensor(done_mask_lst, dtype=torch.float)
-    
+        s_list = torch.tensor(np.array(s_lst), dtype=torch.float).to(device)
+        a_list = torch.tensor(np.array(a_lst), dtype=torch.float).to(device)
+        r_list = torch.tensor(np.array(r_lst), dtype=torch.float).to(device)
+        s_prime_list = torch.tensor(np.array(s_prime_lst), dtype=torch.float).to(device)
+        done_mask_list = torch.tensor(np.array(done_mask_lst), dtype=torch.float).to(device)
+        return s_list, a_list, r_list, s_prime_list, done_mask_list
+
     def size(self):
         return len(self.buffer)
 
 class PolicyNet(nn.Module):
-    def __init__(self, learning_rate):
+    def __init__(self, learning_rate, state_space, action_space):
         super(PolicyNet, self).__init__()
-        self.fc1 = nn.Linear(3, 128)
-        self.fc_mu = nn.Linear(128,1)
-        self.fc_std  = nn.Linear(128,1)
+        self.fc1 = nn.Linear(state_space, 256)
+        self.fc_mu = nn.Linear(256,action_space)
+        self.fc_std  = nn.Linear(256,action_space)
         self.optimizer = optim.Adam(self.parameters(), lr=learning_rate)
 
         self.log_alpha = torch.tensor(np.log(init_alpha))
@@ -66,6 +71,7 @@ class PolicyNet(nn.Module):
         log_prob = dist.log_prob(action)
         real_action = torch.tanh(action)
         real_log_prob = log_prob - torch.log(1-torch.tanh(action).pow(2) + 1e-7)
+        real_log_prob = real_log_prob.sum(-1, keepdim=True)
         return real_action, real_log_prob
 
     def train_net(self, q1, q2, mini_batch):
@@ -88,11 +94,11 @@ class PolicyNet(nn.Module):
         self.log_alpha_optimizer.step()
 
 class QNet(nn.Module):
-    def __init__(self, learning_rate):
+    def __init__(self, learning_rate, state_space, action_space):
         super(QNet, self).__init__()
-        self.fc_s = nn.Linear(3, 64)
-        self.fc_a = nn.Linear(1,64)
-        self.fc_cat = nn.Linear(128,32)
+        self.fc_s = nn.Linear(state_space, 128)
+        self.fc_a = nn.Linear(action_space,128)
+        self.fc_cat = nn.Linear(256,32)
         self.fc_out = nn.Linear(32,1)
         self.optimizer = optim.Adam(self.parameters(), lr=learning_rate)
 
@@ -129,32 +135,43 @@ def calc_target(pi, q1, q2, mini_batch):
     return target
     
 def main():
-    env = gym.make('Pendulum-v1')
+    env = gym.make('Ant-v4')
+    state_space = env.observation_space.shape[0]
+    action_space = env.action_space.shape[0]
+
     memory = ReplayBuffer()
-    q1, q2, q1_target, q2_target = QNet(lr_q), QNet(lr_q), QNet(lr_q), QNet(lr_q)
-    pi = PolicyNet(lr_pi)
+    q1 = QNet(lr_q, state_space, action_space).to(device)
+    q2 = QNet(lr_q, state_space, action_space).to(device)
+    q1_target = QNet(lr_q, state_space, action_space).to(device)
+    q2_target = QNet(lr_q, state_space, action_space).to(device)
+    pi = PolicyNet(lr_pi, state_space, action_space).to(device)
 
     q1_target.load_state_dict(q1.state_dict())
     q2_target.load_state_dict(q2.state_dict())
 
     score = 0.0
-    print_interval = 20
+    print_interval = 10
+    total_steps = 0
 
     for n_epi in range(10000):
         s, _ = env.reset()
         done = False
-        count = 0
+        truncated = False
 
-        while count < 200 and not done:
-            a, log_prob= pi(torch.from_numpy(s).float())
-            s_prime, r, done, truncated, info = env.step([2.0*a.item()])
-            memory.put((s, a.item(), r/10.0, s_prime, done))
+        while not done and not truncated:
+            a, log_prob= pi(torch.from_numpy(s).float().to(device))
+            s_prime, r, done, truncated, info = env.step(a.detach().cpu().numpy())
+            memory.put((s, a.detach().cpu().numpy(), r, s_prime, done))
             score +=r
             s = s_prime
-            count += 1
-                
-        if memory.size()>1000:
-            for i in range(20):
+            total_steps += 1
+
+            if r < min_reward:
+                min_reward = r
+            if r > max_reward:
+                max_reward = r
+
+            if memory.size()>1000:
                 mini_batch = memory.sample(batch_size)
                 td_target = calc_target(pi, q1_target, q2_target, mini_batch)
                 q1.train_net(td_target, mini_batch)
@@ -164,7 +181,7 @@ def main():
                 q2.soft_update(q2_target)
                 
         if n_epi%print_interval==0 and n_epi!=0:
-            print("# of episode :{}, avg score : {:.1f} alpha:{:.4f}".format(n_epi, score/print_interval, pi.log_alpha.exp()))
+            print("# of episode :{}, avg score : {:.1f} alpha:{:.4f}, total steps: {:.1f}M".format(n_epi, score/print_interval, pi.log_alpha.exp()))
             score = 0.0
 
     env.close()
